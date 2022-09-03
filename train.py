@@ -124,7 +124,7 @@ def evaluate(model, data_loader, bert_model):
 
 
 def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, epoch, print_freq,
-                    iterations, bert_model):
+                    iterations, bert_model, scaler):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value}'))
@@ -143,18 +143,23 @@ def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, epoc
         sentences = sentences.squeeze(1)
         attentions = attentions.squeeze(1)
 
-        if bert_model is not None:
-            last_hidden_states = bert_model(sentences, attention_mask=attentions)[0]  # (6, 10, 768)
-            embedding = last_hidden_states.permute(0, 2, 1)  # (B, 768, N_l) to make Conv1d happy
-            attentions = attentions.unsqueeze(dim=-1)  # (batch, N_l, 1)
-            output = model(image, embedding, l_mask=attentions)
-        else:
-            output = model(image, sentences, l_mask=attentions)
+        with torch.cuda.amp.autocast():
+            if bert_model is not None:
+                last_hidden_states = bert_model(sentences, attention_mask=attentions)[0]  # (6, 10, 768)
+                embedding = last_hidden_states.permute(0, 2, 1)  # (B, 768, N_l) to make Conv1d happy
+                attentions = attentions.unsqueeze(dim=-1)  # (batch, N_l, 1)
+                output = model(image, embedding, l_mask=attentions)
+            else:
+                output = model(image, sentences, l_mask=attentions)
 
-        loss = criterion(output, target)
-        optimizer.zero_grad()  # set_to_none=True is only available in pytorch 1.6+
-        loss.backward()
-        optimizer.step()
+            loss = criterion(output, target)
+
+        optimizer.zero_grad(set_to_none=True)  # set_to_none=True is only available in pytorch 1.6+
+        # loss.backward()
+        scaler.scale(loss).backward()
+        # optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         lr_scheduler.step()
 
         torch.cuda.synchronize()
@@ -264,6 +269,9 @@ def main(args):
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,
                                                      lambda x: (1 - x / (len(data_loader) * args.epochs)) ** 0.9)
 
+    from torch.cuda.amp.grad_scaler import GradScaler
+    scaler = GradScaler()
+
     # housekeeping
     start_time = time.time()
     iterations = 0
@@ -281,7 +289,8 @@ def main(args):
     for epoch in range(max(0, resume_epoch+1), args.epochs):
         data_loader.sampler.set_epoch(epoch)
         train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, epoch, args.print_freq,
-                        iterations, bert_model)
+                        iterations, bert_model, scaler)
+
         iou, overallIoU = evaluate(model, data_loader_test, bert_model)
 
         print('Average object IoU {}'.format(iou))
